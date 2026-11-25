@@ -1,0 +1,22 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Artéfacts de build PyInstaller
+build/
+dist/
+*.spec
+
+# Données utilisateur locales / logs / temporaires
+xiqse_data/
+*.log
+*.tmp
+
+# Fichiers système Windows / IDE
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

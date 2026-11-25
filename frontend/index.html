@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XIQ-SE API Studio — Extreme Networks</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 36 36" width="32" height="32">
+            <rect x="2" y="2" width="32" height="32" rx="9" fill="#1e1b4b" stroke="#8b5cf6" stroke-width="2"/>
+            <polygon points="18,7 27,12 27,24 18,29 9,24 9,12" fill="none" stroke="#a78bfa" stroke-width="2"/>
+            <line x1="18" y1="18" x2="18" y2="7" stroke="#38bdf8" stroke-width="1.8"/>
+            <line x1="18" y1="18" x2="27" y2="24" stroke="#38bdf8" stroke-width="1.8"/>
+            <line x1="18" y1="18" x2="9" y2="24" stroke="#38bdf8" stroke-width="1.8"/>
+            <circle cx="18" cy="18" r="3.6" fill="#a855f7" stroke="#fff" stroke-width="1.2"/>
+            <circle cx="18" cy="7" r="2.2" fill="#38bdf8"/>
+            <circle cx="27" cy="12" r="2.2" fill="#38bdf8"/>
+            <circle cx="27" cy="24" r="2.2" fill="#38bdf8"/>
+            <circle cx="18" cy="29" r="2.2" fill="#38bdf8"/>
+            <circle cx="9" cy="24" r="2.2" fill="#38bdf8"/>
+            <circle cx="9" cy="12" r="2.2" fill="#38bdf8"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title">XIQ-SE Studio</div>
+          <div class="brand-sub">Extreme Networks NBI API</div>
+        </div>
+      </div>
+
+      <nav class="nav-menu" id="nav-menu">
+        <div class="nav-section">Vue d'ensemble</div>
+        <button class="nav-item active" data-view="dashboard">
+          <span class="nav-icon">◈</span><span>Tableau de bord</span>
+        </button>
+        <button class="nav-item" data-view="locator">
+          <span class="nav-icon">⌕</span><span>Localisateur Express</span>
+        </button>
+
+        <div class="nav-section">Domaines API NBI</div>
+        <button class="nav-item" data-view="network">
+          <span class="nav-icon">⬡</span><span>Réseau &amp; Inventaire</span>
+        </button>
+        <button class="nav-item" data-view="nac">
+          <span class="nav-icon">⛨</span><span>Contrôle d'accès (NAC)</span>
+        </button>
+        <button class="nav-item" data-view="mac_audit">
+          <span class="nav-icon">◎</span><span>Audit MAC &amp; Doublons</span>
+        </button>
+        <button class="nav-item" data-view="suggestions">
+          <span class="nav-icon">✦</span><span>Suggestions Nettoyage</span>
+        </button>
+        <button class="nav-item" data-view="alarms">
+          <span class="nav-icon">▲</span><span>Alarmes &amp; Événements</span>
+        </button>
+
+        <div class="nav-section">Exploitation 100% API</div>
+        <button class="nav-item" data-view="studio">
+          <span class="nav-icon">⌘</span><span>Studio GraphQL</span>
+          <span class="nav-pill">100%</span>
+        </button>
+        <button class="nav-item" data-view="admin">
+          <span class="nav-icon">⚙</span><span>Administration &amp; Guide</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="conn-card" id="sidebar-conn-card" title="Cliquer pour gérer les connexions XIQ-SE">
+          <div class="conn-dot" id="sidebar-conn-dot"></div>
+          <div class="conn-meta">
+            <div class="conn-name" id="sidebar-profile-name">Chargement...</div>
+            <div class="conn-host" id="sidebar-profile-host">...</div>
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm btn-full" id="btn-open-connections">
+          Gérer les connexions
+        </button>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-left">
+          <h1 class="page-title" id="page-title">Tableau de bord</h1>
+          <span class="mode-badge demo" id="mode-badge">MODE DÉMO</span>
+        </div>
+        <div class="topbar-right">
+          <input id="topbar-global-search" type="text" placeholder="⌕ Localiser MAC / IP / Utilisateur (Ctrl+K)" style="width:265px;padding:5px 10px;font-size:12px;" />
+          <select class="select-compact" id="topbar-profile-select" title="Changer de serveur XIQ-SE"></select>
+          <button class="btn btn-ghost btn-sm" id="btn-test-conn" title="Tester la connexion au serveur actif">
+            Tester API
+          </button>
+          <button class="btn btn-ghost btn-sm" id="btn-refresh-view" title="Actualiser les données de la vue">
+            ↻ Actualiser
+          </button>
+          <button class="btn btn-ghost btn-sm" id="btn-theme-toggle" title="Basculer thème sombre / clair">
+            ◐
+          </button>
+        </div>
+      </header>
+
+      <main class="viewport" id="viewport">
+        <div class="loading-state">Initialisation de XIQ-SE API Studio...</div>
+      </main>
+    </div>
+  </div>
+
+  <!-- MODAL OVERLAY -->
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal-dialog" id="modal-dialog" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h2 id="modal-title">Dialogue</h2>
+        <button class="icon-btn" id="modal-close" aria-label="Fermer">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="/js/api.js"></script>
+  <script src="/js/schema_tools.js"></script>
+  <script src="/js/views_ops.js"></script>
+  <script src="/js/views_tools.js"></script>
+  <script src="/js/views_studio.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
