@@ -313,11 +313,11 @@ window.SchemaTools = (() => {
       // Common XIQ-SE time-range arguments for alarms/events/logs
       const baseType = unwrapType(arg.type)?.name || "String";
       const isNumType = /^(int|long|float|number|biginteger)$/i.test(baseType);
-      if (/^(starttime|begintime|fromtime|startdate|from|since|start)$/i.test(lower)) {
+      if (/^(starttime|begintime|fromtime|startdate|fromdate|starttimestamp|fromtimestamp|sincetime|from|since|start|begin|after)$/i.test(lower)) {
         parts.push(`${aname}: ${isNumType ? startMs : JSON.stringify(new Date(startMs).toISOString())}`);
         continue;
       }
-      if (/^(endtime|totime|enddate|to|until|end)$/i.test(lower)) {
+      if (/^(endtime|totime|enddate|todate|endtimestamp|totimestamp|untiltime|to|until|end|before)$/i.test(lower)) {
         parts.push(`${aname}: ${isNumType ? nowMs : JSON.stringify(new Date(nowMs).toISOString())}`);
         continue;
       }
@@ -328,6 +328,17 @@ window.SchemaTools = (() => {
     }
 
     return parts.length ? `(${parts.join(", ")})` : "";
+  }
+
+  function splitIdentifierTokens(name) {
+    return String(name || "")
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .replace(/[^a-zA-Z0-9]+/g, " ")
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
   }
 
   function findAllFieldsMatching(indexed, regex, opType = "query") {
@@ -351,15 +362,56 @@ window.SchemaTools = (() => {
   }
 
   /**
-   * Smart adaptive query builder for a domain + candidate field names.
+   * Match GraphQL fields using camelCase/snake_case identifier tokens only (avoids false positives like
+   * "default" matching "fault" or "topology" matching "log").
+   */
+  function findFieldsByTokens(indexed, tokenList, opType = "query") {
+    if (!indexed) return [];
+    const wanted = new Set((tokenList || []).map((t) => String(t).toLowerCase()));
+    const groups = opType === "mutation" ? (indexed.mutationGroups || []) : (indexed.queryGroups || []);
+    const matches = [];
+    for (const g of groups) {
+      const domTokens = g.domain === "(Racine)" ? [] : splitIdentifierTokens(g.domain);
+      const domMatch = domTokens.some((t) => wanted.has(t));
+      for (const f of g.fields || []) {
+        const fTokens = splitIdentifierTokens(f.name);
+        if (domMatch || fTokens.some((t) => wanted.has(t))) {
+          matches.push({
+            domainName: g.domain,
+            field: f,
+            callable: buildSafeArgs(f, {}) !== null,
+            opItem: { ...f, path: g.domain === "(Racine)" ? [f.name] : [g.domain, f.name], opType },
+          });
+        }
+      }
+    }
+    return matches;
+  }
+
+  /**
+   * Smart adaptive query builder for a domain (or "(Racine)" root Query) + candidate field names.
    * Automatically handles wrapper types like WsEndSystemListResult -> { endSystem { ... } }!
    */
   function buildAdaptiveDomainQuery(indexed, domainCandidates, fieldCandidates, opts = {}) {
-    const dom = getDomainType(indexed, domainCandidates, "query");
-    if (!dom || !dom.domainType) return null;
+    const isRoot =
+      !domainCandidates ||
+      domainCandidates.length === 0 ||
+      (domainCandidates.length === 1 && domainCandidates[0] === "(Racine)");
 
-    const fieldDef = findFieldByCandidates(indexed, dom.domainType, fieldCandidates);
-    if (!fieldDef) return null;
+    let domainFieldName = null;
+    let fieldDef = null;
+
+    if (isRoot) {
+      if (!indexed?.queryRoot) return null;
+      fieldDef = findFieldByCandidates(indexed, indexed.queryRoot, fieldCandidates);
+      if (!fieldDef) return null;
+    } else {
+      const dom = getDomainType(indexed, domainCandidates, "query");
+      if (!dom || !dom.domainType) return null;
+      domainFieldName = dom.domainFieldName;
+      fieldDef = findFieldByCandidates(indexed, dom.domainType, fieldCandidates);
+      if (!fieldDef) return null;
+    }
 
     const argsStr = buildSafeArgs(fieldDef, opts.args || {}, opts.timeWindowDays || 7);
     if (argsStr === null) return null;
@@ -367,13 +419,18 @@ window.SchemaTools = (() => {
     const retBase = unwrapType(fieldDef.type);
     const retType = getType(indexed, retBase.name);
 
+    const wrapQuery = (inner) =>
+      domainFieldName
+        ? `query {\n  ${domainFieldName} {\n    ${inner}\n  }\n}`
+        : `query {\n  ${inner}\n}`;
+
     // Scalar or list of scalars
     if (!retType || retType.kind === "SCALAR" || retType.kind === "ENUM") {
       return {
-        domainName: dom.domainFieldName,
+        domainName: domainFieldName,
         fieldName: fieldDef.name,
         wrapperListField: null,
-        query: `query { ${dom.domainFieldName} { ${fieldDef.name}${argsStr} } }`,
+        query: wrapQuery(`${fieldDef.name}${argsStr}`),
       };
     }
 
@@ -414,10 +471,10 @@ window.SchemaTools = (() => {
     if (!selection) return null;
 
     return {
-      domainName: dom.domainFieldName,
+      domainName: domainFieldName,
       fieldName: fieldDef.name,
       wrapperListField,
-      query: `query {\n  ${dom.domainFieldName} {\n    ${fieldDef.name}${argsStr} {\n      ${selection}\n    }\n  }\n}`,
+      query: wrapQuery(`${fieldDef.name}${argsStr} {\n      ${selection}\n    }`),
     };
   }
 
@@ -426,9 +483,9 @@ window.SchemaTools = (() => {
    */
   function extractAdaptiveData(res, meta) {
     if (!res || !res.data || !meta) return null;
-    const domObj = res.data[meta.domainName];
-    if (!domObj) return null;
-    const val = domObj[meta.fieldName];
+    const container = meta.domainName ? res.data[meta.domainName] : res.data;
+    if (!container) return null;
+    const val = container[meta.fieldName];
     if (val === null || val === undefined) return null;
     if (meta.wrapperListField && typeof val === "object" && !Array.isArray(val)) {
       return val[meta.wrapperListField] ?? [];
@@ -629,6 +686,8 @@ window.SchemaTools = (() => {
     listCallableDomainQueries,
     listDomainMutations,
     findAllFieldsMatching,
+    findFieldsByTokens,
+    splitIdentifierTokens,
     buildOperationSnippet,
     extractTableRows,
   };

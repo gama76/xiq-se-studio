@@ -99,6 +99,19 @@ def run_tests() -> None:
         assert "AA:BB:CC:00:33:44" in bres["data"]["accessControl"]["g1"]["entries"]
         assert "AA:BB:CC:00:11:22" in bres["data"]["accessControl"]["g2"]["entries"]  # Duplicate across 2 groups
 
+        # 6d. Verify aliased batch devicesBySiteLocation & device(ip) queries (multi-site expansion)
+        site_batch_q = """query BatchDevicesBySite {
+          network {
+            s0: devicesBySiteLocation(location: "/World/France/Paris-HQ") { ip sysName status }
+            s1: devicesBySiteLocation(location: "/World/France/Lyon-Branch") { ip sysName status }
+            d0: device(ip: "10.10.1.1") { ip sysName status }
+          }
+        }"""
+        sb_res = ctx.execute_graphql(site_batch_q, record_history=False)
+        assert sb_res["ok"], f"Batch devicesBySiteLocation failed: {sb_res.get('errors')}"
+        assert len(sb_res["data"]["network"]["s0"]) >= 1
+        assert sb_res["data"]["network"]["d0"]["ip"] == "10.10.1.1"
+
         # Audit summary persistence
         ctx.storage.save_audit_summary("demo-simulator", {"neverSeenCount": 3, "duplicateCount": 1, "totalUniqueGroupMacs": 8})
         saved_sum = ctx.storage.get_audit_summary("demo-simulator")

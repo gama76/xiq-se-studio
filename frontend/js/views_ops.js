@@ -132,11 +132,155 @@ window.OpsViews = (() => {
           ? `limit (${maxArg || inputObjPagination.maxKey})`
           : `none (args: ${argNames.join(", ") || "aucun"})`;
 
-    // Case 1: No pagination arguments at all on this GraphQL field -> single request
+    // Case 1: No pagination arguments at all on this GraphQL field
     if (!hasOffsetMode && !hasPageMode && !hasMaxOnly) {
       const res = await runAdaptive(indexed, domainCandidates, [field.name], opts, source);
-      const list = Array.isArray(res.data) ? res.data : [];
-      return { ...res, data: list, truncatedByLimit: false, paginationMode };
+      const baseList = Array.isArray(res.data) ? res.data : [];
+
+      // XIQ-SE specific workaround: on many versions, `network.devices` takes NO pagination arguments
+      // and can be capped server-side (e.g. 250). When scope > 250, expand via `network.sites` +
+      // batched `devicesBySiteLocation(location: ...)` and missing `devList` IPs via `device(ip: ...)`!
+      const isNetworkDevices =
+        dom.domainFieldName === "network" &&
+        /^(devices|alldevices)$/i.test(field.name);
+      const bySiteField = isNetworkDevices
+        ? SchemaTools.findFieldByCandidates(indexed, dom.domainType, ["devicesBySiteLocation", "devicesBySite"])
+        : null;
+      const singleDevField = isNetworkDevices
+        ? SchemaTools.findFieldByCandidates(indexed, dom.domainType, ["device", "deviceByIp"])
+        : null;
+
+      if (isNetworkDevices && targetMax > 250 && (bySiteField || singleDevField)) {
+        const allItems = [];
+        const seenKeys = new Set();
+        baseList.forEach((item) => {
+          const k = extractItemKey(item);
+          if (!seenKeys.has(k)) {
+            seenKeys.add(k);
+            allItems.push(item);
+          }
+        });
+        if (typeof onProgress === "function") onProgress(allItems.length, limitMode === "all" ? null : targetMax);
+
+        const sitesRes = await runAdaptive(
+          indexed,
+          ["network"],
+          ["sites", "allSites"],
+          { preferredScalars: ["location", "sitePath", "name", "siteName", "devList"], includeAllScalars: false },
+          source
+        );
+        const sites = Array.isArray(sitesRes.data) ? sitesRes.data : [];
+        const siteLocations = Array.from(
+          new Set(sites.map((s) => s?.location || s?.sitePath).filter(Boolean))
+        );
+        const siteDevIps = new Set();
+        sites.forEach((s) => {
+          if (Array.isArray(s?.devList)) {
+            s.devList.forEach((ip) => {
+              if (ip) siteDevIps.add(String(ip).trim());
+            });
+          }
+        });
+
+        // Build safe selection for Device type
+        const devBase = SchemaTools.unwrapType(field.type);
+        const devSel = devBase
+          ? SchemaTools.buildSafeSelection(
+              indexed,
+              devBase.name,
+              opts.preferredScalars || ["ip", "sysName", "deviceName", "status", "down", "sitePath"],
+              opts.nestedSpecs || [],
+              opts.includeAllScalars !== false
+            )
+          : "ip sysName deviceName status sitePath";
+
+        let extraViaSites = 0;
+        let extraViaIp = 0;
+
+        // 1) Batched aliased `devicesBySiteLocation(location: ...)`
+        if (bySiteField && siteLocations.length && devSel && allItems.length < targetMax) {
+          const locArgName = (bySiteField.args || [])[0]?.name || "location";
+          const batchSize = 8;
+          for (let i = 0; i < siteLocations.length && allItems.length < targetMax; i += batchSize) {
+            const chunk = siteLocations.slice(i, i + batchSize);
+            const aliased = chunk
+              .map((loc, idx) => `s${idx}: ${bySiteField.name}(${locArgName}: ${JSON.stringify(loc)}) { ${devSel} }`)
+              .join("\n    ");
+            const batchQ = `query BatchDevicesBySite {\n  ${dom.domainFieldName} {\n    ${aliased}\n  }\n}`;
+            const bRes = await runOp(batchQ, {}, source, false);
+            if (bRes.ok && bRes.data?.[dom.domainFieldName]) {
+              const netObj = bRes.data[dom.domainFieldName];
+              Object.values(netObj).forEach((arr) => {
+                if (!Array.isArray(arr)) return;
+                arr.forEach((item) => {
+                  if (allItems.length >= targetMax) return;
+                  const k = extractItemKey(item);
+                  if (!seenKeys.has(k)) {
+                    seenKeys.add(k);
+                    allItems.push(item);
+                    extraViaSites++;
+                  }
+                });
+              });
+              if (typeof onProgress === "function") onProgress(allItems.length, limitMode === "all" ? null : targetMax);
+            }
+          }
+        }
+
+        // 2) If sites.devList lists IPs still missing (e.g. a single huge site > 250), fetch by IP via `device(ip: ...)`
+        if (singleDevField && siteDevIps.size && devSel && allItems.length < targetMax) {
+          const missingIps = Array.from(siteDevIps).filter((ip) => !seenKeys.has(ip.toLowerCase()));
+          const ipArgName = (singleDevField.args || []).find((a) => /ip/i.test(a.name))?.name || (singleDevField.args || [])[0]?.name || "ip";
+          const ipBatchSize = 15;
+          for (let i = 0; i < missingIps.length && allItems.length < targetMax; i += ipBatchSize) {
+            const chunk = missingIps.slice(i, i + ipBatchSize);
+            const aliased = chunk
+              .map((ip, idx) => `d${idx}: ${singleDevField.name}(${ipArgName}: ${JSON.stringify(ip)}) { ${devSel} }`)
+              .join("\n    ");
+            const batchQ = `query BatchDevicesByIp {\n  ${dom.domainFieldName} {\n    ${aliased}\n  }\n}`;
+            const bRes = await runOp(batchQ, {}, source, false);
+            if (bRes.ok && bRes.data?.[dom.domainFieldName]) {
+              const netObj = bRes.data[dom.domainFieldName];
+              Object.values(netObj).forEach((item) => {
+                if (!item || typeof item !== "object" || allItems.length >= targetMax) return;
+                const k = extractItemKey(item);
+                if (!seenKeys.has(k)) {
+                  seenKeys.add(k);
+                  allItems.push(item);
+                  extraViaIp++;
+                }
+              });
+              if (typeof onProgress === "function") onProgress(allItems.length, limitMode === "all" ? null : targetMax);
+            }
+          }
+        }
+
+        const totalExtra = extraViaSites + extraViaIp;
+        const expandedMode = totalExtra > 0
+          ? `multi-sites (+${totalExtra} via ${extraViaSites ? bySiteField.name : singleDevField.name})`
+          : `complet (${allItems.length} équip. — ${siteLocations.length} site(s) vérifié(s))`;
+        return {
+          ...res,
+          data: allItems,
+          truncatedByLimit: Boolean(limitMode !== "all" && allItems.length >= targetMax),
+          paginationMode: expandedMode,
+        };
+      }
+
+      const maybeServerCapped = Boolean(
+        isNetworkDevices &&
+        (bySiteField || singleDevField) &&
+        limitMode === "250" &&
+        baseList.length >= 250
+      );
+      return {
+        ...res,
+        data: baseList,
+        truncatedByLimit: maybeServerCapped,
+        paginationMode: maybeServerCapped
+          ? "plafond 250 possible — passez en portée supérieure (multi-sites)"
+          : paginationMode,
+      };
     }
 
     // Case 2: Fast 250 mode (single request)
@@ -437,7 +581,9 @@ window.OpsViews = (() => {
   }
 
   function isDeviceUp(dev) {
-    const s = dev?.status;
+    if (!dev || typeof dev !== "object") return false;
+    if (typeof dev.down === "boolean") return !dev.down;
+    const s = dev.status ?? dev.lastStatus;
     if (typeof s === "boolean") return s;
     if (typeof s === "number") return s === 1;
     const str = String(s || "").toLowerCase();
@@ -455,37 +601,204 @@ window.OpsViews = (() => {
     return s.siteId || "Site";
   }
 
-  // Helper: discover and fetch alarms from ANY matching domain/field in live __schema or Device.alarms
-  async function fetchDiscoveredAlarms(indexed, timeWindowDays = 7, source = "alarms") {
-    if (!indexed) return { available: false, items: [], query: "", matchedOps: [], errors: [] };
-    const matchedOps = SchemaTools.findAllFieldsMatching(indexed, /alarm|alert|fault|incident/i, "query");
-    const callableOps = matchedOps.filter((m) => m.callable && m.domainName !== "(Racine)");
+  const ALARM_NESTED_SPECS = [
+    { candidates: ["device", "sourceDevice", "switch"], preferred: ["ip", "ipAddress", "sysName", "deviceName", "name", "sitePath"] },
+    { candidates: ["source", "origin", "target"], preferred: ["ip", "ipAddress", "name", "sysName", "macAddress"] },
+    { candidates: ["endSystem", "client"], preferred: ["macAddress", "ipAddress", "hostName", "username"] },
+    { candidates: ["port", "interface"], preferred: ["name", "ifName", "alias"] },
+  ];
 
-    for (const op of callableOps) {
+  function scoreAlarmOp(op) {
+    const n = String(op?.field?.name || "").toLowerCase();
+    const d = String(op?.domainName || "").toLowerCase();
+    let score = 0;
+    if (/^(activealarms|alarms|allalarms|currentalarms|openalarms)$/.test(n)) score += 100;
+    else if (/^(alarmevents|alarmhistory|devicealarms|networkalarms|alerts|faults|incidents)$/.test(n)) score += 75;
+    else if (/alarm|alert|fault/.test(n)) score += 40;
+    if (/alarm|fault|alert|monitor/.test(d)) score += 20;
+    if (d === "(racine)") score += 10;
+    // Penalize configuration / definition / metadata queries so real alarms always win
+    if (/def|config|rule|action|template|setting|policy|filter|criteria|count|summary|stat|type|categor|severity|enable|disable|email|notif/.test(n)) {
+      score -= 120;
+    }
+    return score;
+  }
+
+  function scoreEventOp(op) {
+    const n = String(op?.field?.name || "").toLowerCase();
+    const d = String(op?.domainName || "").toLowerCase();
+    let score = 0;
+    if (/^(events|recentevents|allevents|eventlogs|eventhistory|systemevents|networkevents)$/.test(n)) score += 100;
+    else if (/^(auditevents|auditlogs|syslogevents|trapevents|nacevents|logs)$/.test(n)) score += 75;
+    else if (/event|log|trap|syslog|audit/.test(n)) score += 35;
+    if (/alarm|event|log|audit|monitor|admin/.test(d)) score += 15;
+    if (d === "(Racine)" || d === "(racine)") score += 10;
+    // Penalize server config / definitions / receivers
+    if (/server|receiver|config|def|rule|setting|template|filter|policy|count|summary|stat|type|categor|login|logout|password|catalog/.test(n)) {
+      score -= 120;
+    }
+    return score;
+  }
+
+  function formatFlexTimestamp(raw) {
+    if (raw === null || raw === undefined || raw === "") return "";
+    if (typeof raw === "number" || /^\d{10,13}$/.test(String(raw).trim())) {
+      const n = Number(raw);
+      const ms = n < 1e12 ? n * 1000 : n;
+      const dt = new Date(ms);
+      if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 19).replace("T", " ");
+    }
+    return String(raw).slice(0, 19).replace("T", " ");
+  }
+
+  function normalizeAlarmRecord(a) {
+    if (!a || typeof a !== "object") {
+      return { raw: a, id: "", severity: "Info", sourceName: "—", sourceIp: "", message: String(a || ""), timestamp: "", acknowledged: false };
+    }
+    const dev = a.device || a.sourceDevice || a.switch || a.source || {};
+    const id = a.id ?? a.alarmId ?? a.eventId ?? "";
+    const severity = String(a.severity ?? a.alarmSeverity ?? a.level ?? a.priority ?? "Info");
+    const sourceIp =
+      a.sourceIp ?? a.deviceIp ?? a.ipAddress ?? a.ip ??
+      (typeof dev === "object" ? (dev.ip ?? dev.ipAddress ?? "") : "");
+    const sourceName =
+      a.sourceName ?? a.deviceName ?? a.sysName ??
+      (typeof dev === "object" ? (dev.sysName ?? dev.deviceName ?? dev.name ?? "") : (typeof a.source === "string" ? a.source : "")) ??
+      sourceIp ?? "—";
+    const msgParts = [
+      a.alarmName || a.name || a.title || "",
+      a.message || a.description || a.info || a.reason || a.summary || "",
+    ].filter(Boolean);
+    const message = msgParts.length > 1 && !msgParts[1].includes(msgParts[0])
+      ? `${msgParts[0]} — ${msgParts[1]}`
+      : (msgParts[0] || "");
+    const rawTs = a.lastOccurrenceTime ?? a.occurredTime ?? a.occuredTime ?? a.timestamp ?? a.createTime ?? a.time ?? a.date ?? "";
+    const acknowledged = Boolean(a.acknowledged ?? a.isAcknowledged ?? a.ack);
+    return {
+      raw: a,
+      id: String(id),
+      severity,
+      sourceName: String(sourceName || sourceIp || "—"),
+      sourceIp: String(sourceIp || ""),
+      message: String(message),
+      timestamp: formatFlexTimestamp(rawTs),
+      acknowledged,
+    };
+  }
+
+  function matchesSeverityFilter(sevRaw, filter) {
+    if (filter === "ALL") return true;
+    const s = String(sevRaw || "").toLowerCase();
+    if (filter === "Critical") return /crit|fatal|emerg/.test(s);
+    if (filter === "Error") return /err|major|severe|high/.test(s);
+    if (filter === "Warning") return /warn|minor|med/.test(s);
+    if (filter === "Info") return /info|notice|low|clear|normal/.test(s);
+    return s === filter.toLowerCase();
+  }
+
+  async function probeDiscoveredOps(indexed, ops, scoreFn, wrapperCands, timeWindowDays, source, preferredKey = "") {
+    const sorted = [...ops].sort((a, b) => scoreFn(b) - scoreFn(a));
+    const callable = sorted.filter((o) => o.callable);
+    const probes = [];
+    const workingSources = [];
+    const candidatesToTry = callable.slice(0, 8);
+
+    // Ensure explicitly selected source is always probed even if ranked beyond 8
+    if (preferredKey) {
+      const explicit = callable.find((o) => `${o.domainName}.${o.field.name}` === preferredKey);
+      if (explicit && !candidatesToTry.includes(explicit)) candidatesToTry.unshift(explicit);
+    }
+
+    for (const op of candidatesToTry) {
+      const key = `${op.domainName}.${op.field.name}`;
+      const score = scoreFn(op);
       const res = await runAdaptive(
         indexed,
         [op.domainName],
         [op.field.name],
         {
           timeWindowDays,
-          wrapperCandidates: ["alarms", "activeAlarms", "alarmEvents", "items", "results", "list", "data"],
+          wrapperCandidates: wrapperCands,
+          nestedSpecs: ALARM_NESTED_SPECS,
           includeAllScalars: true,
         },
         source
       );
-      if (res.ok && Array.isArray(res.data)) {
-        return { available: true, items: res.data, query: res.query, sourceLabel: `${op.domainName}.${op.field.name}`, matchedOps, errors: res.errors || [] };
-      }
+      const isArr = res.ok && Array.isArray(res.data);
+      const items = isArr ? res.data : (res.ok && res.data && typeof res.data === "object" ? [res.data] : []);
+      const errMsg = (res.errors || []).map((e) => e.message || String(e)).join(" | ");
+      const probe = {
+        key,
+        domainName: op.domainName,
+        fieldName: op.field.name,
+        score,
+        ok: res.ok && isArr,
+        rawOk: res.ok,
+        count: items.length,
+        items,
+        query: res.query || "",
+        errors: res.errors || [],
+        errorMsg: errMsg,
+      };
+      probes.push(probe);
+      if (probe.ok) workingSources.push(probe);
     }
 
-    // Check if Device type itself exposes an `alarms` sub-field (network.devices { ip sysName alarms { ... } })
+    let chosen = null;
+    if (preferredKey) {
+      chosen = workingSources.find((p) => p.key === preferredKey) || null;
+    }
+    if (!chosen) {
+      // Prefer first non-config source that actually returned >= 1 item
+      chosen = workingSources.find((p) => p.score >= 0 && p.count > 0)
+        || workingSources.find((p) => p.count > 0)
+        || workingSources.find((p) => p.score >= 0)
+        || workingSources[0]
+        || null;
+    }
+
+    return { chosen, probes, workingSources };
+  }
+
+  const ALARM_QUERY_TOKENS = ["alarm", "alarms", "alert", "alerts", "fault", "faults", "incident", "incidents"];
+  const EVENT_QUERY_TOKENS = ["event", "events", "trap", "traps", "syslog", "syslogs", "audit", "audits", "eventlog", "eventlogs", "auditlog", "auditlogs"];
+
+  // Helper: discover and fetch alarms from ANY matching root/domain field in live __schema or Device.alarms
+  async function fetchDiscoveredAlarms(indexed, timeWindowDays = 7, source = "alarms", preferredKey = "") {
+    if (!indexed) return { available: false, items: [], query: "", sourceLabel: "", matchedOps: [], errors: [], probes: [], workingSources: [] };
+    const matchedOps = SchemaTools.findFieldsByTokens(indexed, ALARM_QUERY_TOKENS, "query");
+
+    const { chosen, probes, workingSources } = await probeDiscoveredOps(
+      indexed,
+      matchedOps,
+      scoreAlarmOp,
+      ["alarms", "activeAlarms", "alarmEvents", "alarmHistory", "alerts", "faults", "items", "results", "list", "data"],
+      timeWindowDays,
+      source,
+      preferredKey
+    );
+
+    if (chosen && (chosen.count > 0 || preferredKey)) {
+      return {
+        available: true,
+        items: chosen.items,
+        query: chosen.query,
+        sourceLabel: chosen.key,
+        matchedOps,
+        errors: chosen.errors,
+        probes,
+        workingSources,
+      };
+    }
+
+    // Also check if Device type itself exposes an `alarms` sub-field (network.devices { ip sysName alarms { ... } })
     const netDom = SchemaTools.getDomainType(indexed, ["network"], "query");
     const devField = netDom ? SchemaTools.findFieldByCandidates(indexed, netDom.domainType, ["devices", "allDevices"]) : null;
     const devBase = devField ? SchemaTools.unwrapType(devField.type) : null;
     const devType = devBase ? SchemaTools.getType(indexed, devBase.name) : null;
-    const devAlarmField = devType ? SchemaTools.findFieldByCandidates(indexed, devType, ["alarms", "activeAlarms", "alarmList"]) : null;
+    const devAlarmField = devType ? SchemaTools.findFieldByCandidates(indexed, devType, ["alarms", "activeAlarms", "alarmList", "alarmEvents"]) : null;
     if (devAlarmField && !(devAlarmField.args || []).some((a) => SchemaTools.isNonNull(a.type))) {
-      const res = await runAdaptive(
+      const res = await runAdaptivePaginated(
         indexed,
         ["network"],
         [devField.name],
@@ -494,7 +807,8 @@ window.OpsViews = (() => {
           nestedSpecs: [{ candidates: [devAlarmField.name], includeAllScalars: true }],
           includeAllScalars: false,
         },
-        source
+        source,
+        "all"
       );
       if (res.ok && Array.isArray(res.data)) {
         const flat = [];
@@ -504,11 +818,51 @@ window.OpsViews = (() => {
             arr.forEach((a) => flat.push({ sourceName: d.sysName || d.deviceName || d.ip, sourceIp: d.ip, ...(typeof a === "object" ? a : { message: a }) }));
           }
         });
-        return { available: true, items: flat, query: res.query, sourceLabel: `network.${devField.name}.${devAlarmField.name}`, matchedOps, errors: res.errors || [] };
+        const devProbe = {
+          key: `network.${devField.name}.${devAlarmField.name}`,
+          domainName: "network",
+          fieldName: `${devField.name}.${devAlarmField.name}`,
+          score: 50,
+          ok: true,
+          rawOk: true,
+          count: flat.length,
+          items: flat,
+          query: res.query || "",
+          errors: res.errors || [],
+          errorMsg: "",
+        };
+        probes.push(devProbe);
+        workingSources.push(devProbe);
+        if (flat.length > 0 || !chosen) {
+          return {
+            available: true,
+            items: flat,
+            query: res.query,
+            sourceLabel: devProbe.key,
+            matchedOps,
+            errors: res.errors || [],
+            probes,
+            workingSources,
+          };
+        }
       }
     }
 
-    return { available: false, items: [], query: "", sourceLabel: "", matchedOps, errors: [] };
+    if (chosen) {
+      return {
+        available: true,
+        items: chosen.items,
+        query: chosen.query,
+        sourceLabel: chosen.key,
+        matchedOps,
+        errors: chosen.errors,
+        probes,
+        workingSources,
+      };
+    }
+
+    const probeErrors = probes.flatMap((p) => p.errors || []);
+    return { available: false, items: [], query: probes[0]?.query || "", sourceLabel: "", matchedOps, errors: probeErrors, probes, workingSources };
   }
 
   // =========================================================================
@@ -534,7 +888,7 @@ window.OpsViews = (() => {
         ["network"],
         ["devices", "allDevices"],
         {
-          preferredScalars: ["ip", "sysName", "deviceName", "name", "status", "up", "deviceDisplayFamily", "family", "sitePath", "firmware", "sysUpTime"],
+          preferredScalars: ["ip", "sysName", "deviceName", "name", "status", "down", "lastStatus", "up", "deviceDisplayFamily", "family", "sitePath", "firmware", "sysUpTime"],
           includeAllScalars: false,
         },
         "dashboard",
@@ -620,7 +974,10 @@ window.OpsViews = (() => {
     const upCount = devices.filter(isDeviceUp).length;
     const downCount = devices.length - upCount;
     const upPct = devices.length ? Math.round((upCount / devices.length) * 100) : 100;
-    const critAlarms = alarms.filter((a) => ["Critical", "Error", "CRITICAL", "ERROR"].includes(String(a.severity || "")) && !a.acknowledged).length;
+    const critAlarms = alarms
+      .map(normalizeAlarmRecord)
+      .filter((a) => (matchesSeverityFilter(a.severity, "Critical") || matchesSeverityFilter(a.severity, "Error")) && !a.acknowledged)
+      .length;
     const applianceSessions = appliances.reduce((s, a) => s + (Number(a.activeEndSystems ?? a.endSystemCount) || 0), 0);
     const totalSessions = Math.max(applianceSessions, allNacMacs.length, endSystems.length);
 
@@ -912,7 +1269,7 @@ window.OpsViews = (() => {
       {
         preferredScalars: [
           "ip", "sysName", "deviceName", "name", "baseMac", "macAddress",
-          "status", "up", "deviceDisplayFamily", "family", "firmware",
+          "status", "down", "lastStatus", "up", "deviceDisplayFamily", "family", "firmware",
           "sitePath", "sysUpTime", "sysDescr",
         ],
         nestedSpecs: [
@@ -3628,53 +3985,154 @@ window.OpsViews = (() => {
   }
 
   // =========================================================================
-  // 6. ALARMS & EVENTS (Full-Schema Auto-Discovery + Availability Alerts)
+  // 6. ALARMS & EVENTS (Full-Schema Auto-Discovery + Real-Time NBI Health Alerts)
   // =========================================================================
-  const almState = { tab: "alarms", sev: "ALL", days: 7 };
+  const almState = { tab: "alarms", subTab: "down", sev: "ALL", days: 7, search: "", alarmSourceKey: "", eventSourceKey: "" };
+
+  function buildAdaptiveAlarmMutation(indexed, mutOp, alarmId) {
+    if (!mutOp) return null;
+    const field = mutOp.field;
+    const isRoot = mutOp.domainName === "(Racine)";
+    const inputArg = (field.args || []).find((a) => a.name === "input");
+    const retBase = SchemaTools.unwrapType(field.type);
+    const retSel = (retBase && SchemaTools.buildSafeSelection(indexed, retBase.name, ["status", "message", "errorCode", "success"], [], false)) || "status message";
+
+    if (inputArg) {
+      const inputTypeName = SchemaTools.unwrapType(inputArg.type).name;
+      const inputType = SchemaTools.getType(indexed, inputTypeName);
+      const inFields = (inputType?.inputFields || []).map((f) => f.name);
+      const payload = {};
+      if (inFields.includes("id")) payload.id = alarmId;
+      else if (inFields.includes("alarmId")) payload.alarmId = alarmId;
+      else if (inFields.includes("ids")) payload.ids = [alarmId];
+      else if (inFields.includes("alarmIds")) payload.alarmIds = [alarmId];
+      else payload.id = alarmId;
+      const gqlType = SchemaTools.formatTypeRef(inputArg.type);
+      const body = `${field.name}(input: $input) { ${retSel} }`;
+      return {
+        query: isRoot
+          ? `mutation ExecAlmMut($input: ${gqlType}) { ${body} }`
+          : `mutation ExecAlmMut($input: ${gqlType}) { ${mutOp.domainName} { ${body} } }`,
+        variables: { input: payload },
+        domainName: isRoot ? null : mutOp.domainName,
+        fieldName: field.name,
+      };
+    }
+
+    const idArg = (field.args || []).find((a) => /^(id|alarmid)$/i.test(a.name)) || (field.args || [])[0];
+    if (!idArg) return null;
+    const gqlType = SchemaTools.formatTypeRef(idArg.type);
+    const body = `${field.name}(${idArg.name}: $id) { ${retSel} }`;
+    return {
+      query: isRoot
+        ? `mutation ExecAlmMut($id: ${gqlType}) { ${body} }`
+        : `mutation ExecAlmMut($id: ${gqlType}) { ${mutOp.domainName} { ${body} } }`,
+      variables: { id: alarmId },
+      domainName: isRoot ? null : mutOp.domainName,
+      fieldName: field.name,
+    };
+  }
 
   async function renderAlarms(viewport) {
     viewport.classList.remove("studio-mode");
-    viewport.innerHTML = `<div class="loading-state">Découverte automatique des Alarmes &amp; Événements sur votre schéma XIQ-SE...</div>`;
+    viewport.innerHTML = `<div class="loading-state">Chargement des Alarmes, Événements &amp; Alertes de santé XIQ-SE...</div>`;
 
     const indexed = await getSchema();
-    const alarmOps = SchemaTools.findAllFieldsMatching(indexed, /alarm|alert|fault|incident/i, "query");
-    const eventOps = SchemaTools.findAllFieldsMatching(indexed, /event|trap|syslog|audit|log/i, "query");
-    const allRelatedMuts = SchemaTools.findAllFieldsMatching(indexed, /alarm|alert|event/i, "mutation");
+    const pid = window.XIQApp?.getActiveProfile?.()?.id || "default";
+    const alarmOps = SchemaTools.findFieldsByTokens(indexed, ALARM_QUERY_TOKENS, "query");
+    const eventOps = SchemaTools.findFieldsByTokens(indexed, EVENT_QUERY_TOKENS, "query");
+    const allRelatedMuts = SchemaTools.findFieldsByTokens(indexed, [...ALARM_QUERY_TOKENS, ...EVENT_QUERY_TOKENS], "mutation");
 
-    const fetchFirstMatching = async (ops, wrapperCands) => {
-      for (const op of ops.filter((o) => o.callable && o.domainName !== "(Racine)")) {
-        const res = await runAdaptive(
-          indexed,
-          [op.domainName],
-          [op.field.name],
-          { timeWindowDays: almState.days, wrapperCandidates: wrapperCands, includeAllScalars: true },
-          "alarms"
-        );
-        if (res.ok && Array.isArray(res.data)) {
-          return { available: true, items: res.data, query: res.query, sourceLabel: `${op.domainName}.${op.field.name}`, errors: res.errors || [] };
-        }
-      }
-      return { available: false, items: [], query: "", sourceLabel: "", errors: [] };
-    };
-
-    const [almRes, evtRes, devStatusRes] = await Promise.all([
-      fetchDiscoveredAlarms(indexed, almState.days, "alarms"),
-      fetchFirstMatching(eventOps, ["events", "recentEvents", "eventLogs", "items", "results", "list"]),
-      runAdaptive(
+    const [almRes, evtProbeRes, devStatusRes, nacAppRes, nacEsRes, auditSumRes] = await Promise.all([
+      fetchDiscoveredAlarms(indexed, almState.days, "alarms", almState.alarmSourceKey),
+      probeDiscoveredOps(
+        indexed,
+        eventOps,
+        scoreEventOp,
+        ["events", "recentEvents", "eventLogs", "auditEvents", "items", "results", "list", "data"],
+        almState.days,
+        "alarms",
+        almState.eventSourceKey
+      ),
+      runAdaptivePaginated(
         indexed,
         ["network"],
         ["devices", "allDevices"],
-        { preferredScalars: ["ip", "sysName", "deviceName", "status", "sitePath", "deviceDisplayFamily", "sysUpTime"], includeAllScalars: false },
+        { preferredScalars: ["ip", "sysName", "deviceName", "status", "down", "lastStatus", "sitePath", "deviceDisplayFamily", "sysUpTime"], includeAllScalars: false },
+        "alarms",
+        "all"
+      ),
+      runAdaptive(
+        indexed,
+        ["accessControl"],
+        ["appliances", "engines", "nacAppliances", "allAppliances"],
+        { preferredScalars: ["displayName", "name", "hostName", "ipAddress", "ip", "status", "state", "version", "engineGroup", "activeEndSystems", "endSystemCount"], includeAllScalars: true },
         "alarms"
       ),
+      runAdaptivePaginated(
+        indexed,
+        ["accessControl"],
+        ["endSystems", "allEndSystemsAsProperties", "allEndSystems"],
+        {
+          wrapperCandidates: ["endSystem", "endSystems", "results", "items"],
+          preferredScalars: [
+            "macAddress", "ipAddress", "username", "userName", "hostName",
+            "switchIp", "switchIP", "portName", "switchPortName", "switchPort", "port",
+            "state", "authorizationState", "status", "authType", "profile", "policy", "vlan", "lastSeenTime",
+          ],
+          includeAllScalars: false,
+        },
+        "alarms",
+        "1000"
+      ),
+      XIQApi.getAuditSummary(pid).catch(() => ({ summary: null })),
     ]);
 
-    const alarms = almRes.items || [];
-    const events = evtRes.items || [];
-    const downDevices = (Array.isArray(devStatusRes.data) ? devStatusRes.data : []).filter((d) => !isDeviceUp(d));
+    const evtChosen = evtProbeRes.chosen;
+    const evtRes = evtChosen
+      ? {
+          available: true,
+          items: evtChosen.items,
+          query: evtChosen.query,
+          sourceLabel: evtChosen.key,
+          errors: evtChosen.errors || [],
+          probes: evtProbeRes.probes,
+          workingSources: evtProbeRes.workingSources,
+        }
+      : {
+          available: false,
+          items: [],
+          query: evtProbeRes.probes[0]?.query || "",
+          sourceLabel: "",
+          errors: evtProbeRes.probes.flatMap((p) => p.errors || []),
+          probes: evtProbeRes.probes,
+          workingSources: evtProbeRes.workingSources,
+        };
 
-    const hasAck = allRelatedMuts.some((m) => m.field.name === "acknowledgeAlarm");
-    const hasClr = allRelatedMuts.some((m) => m.field.name === "clearAlarm");
+    const rawAlarms = almRes.items || [];
+    const normAlarms = rawAlarms.map(normalizeAlarmRecord);
+    const events = evtRes.items || [];
+    const allDevices = Array.isArray(devStatusRes.data) ? devStatusRes.data : [];
+    const allDevicesCount = allDevices.length;
+    const downDevices = allDevices.filter((d) => !isDeviceUp(d));
+    const appliances = Array.isArray(nacAppRes.data) ? nacAppRes.data : [];
+    const alertAppliances = appliances.filter((a) => /down|err|fail|off|warn|degrad/i.test(String(a.status || a.state || "")));
+    const sampledEndSystems = Array.isArray(nacEsRes.data) ? nacEsRes.data : [];
+    const blockedEndSystems = sampledEndSystems.filter((e) =>
+      /quarant|reject|block|deny|fail|black/i.test(String(e?.state || e?.authorizationState || e?.status || ""))
+    );
+    const auditSummary = auditSumRes?.summary || null;
+
+    const ackMutOp = allRelatedMuts.find((m) => /acknowledge.*alarm|ack.*alarm/i.test(m.field.name)) || null;
+    const clrMutOp = allRelatedMuts.find((m) => /clear.*alarm|close.*alarm|delete.*alarm/i.test(m.field.name)) || null;
+    const hasAck = Boolean(ackMutOp);
+    const hasClr = Boolean(clrMutOp);
+
+    // Combine probe diagnostics (deduplicated by domain.field)
+    const probeMap = new Map();
+    [...(almRes.probes || []), ...(evtRes.probes || [])].forEach((p) => {
+      if (!probeMap.has(p.key)) probeMap.set(p.key, p);
+    });
 
     const allDiscoveredQueries = [...alarmOps, ...eventOps];
     const uniqueDiscovered = [];
@@ -3688,95 +4146,326 @@ window.OpsViews = (() => {
     });
 
     const drawAlm = () => {
-      const filtered = almState.sev === "ALL" ? alarms : alarms.filter((a) => String(a.severity || "").toLowerCase() === almState.sev.toLowerCase());
+      const q = almState.search.trim().toLowerCase();
+      const filteredAlarms = normAlarms.filter((a) => {
+        if (!matchesSeverityFilter(a.severity, almState.sev)) return false;
+        if (!q) return true;
+        return [a.id, a.severity, a.sourceName, a.sourceIp, a.message, a.timestamp]
+          .some((v) => String(v || "").toLowerCase().includes(q));
+      });
+      const filteredEvents = events.filter((ev) => {
+        if (!q) return true;
+        return JSON.stringify(ev || "").toLowerCase().includes(q);
+      });
+      const filteredDown = downDevices.filter((d) => {
+        if (!q) return true;
+        return [d.ip, d.sysName, d.deviceName, d.sitePath, d.deviceDisplayFamily]
+          .some((v) => String(v || "").toLowerCase().includes(q));
+      });
+      const filteredBlocked = blockedEndSystems.filter((e) => {
+        if (!q) return true;
+        return [e.macAddress, e.ipAddress, e.username, e.userName, e.hostName, e.switchIp, e.switchIP, e.profile, e.state]
+          .some((v) => String(v || "").toLowerCase().includes(q));
+      });
+      const activeProbes = Array.from(probeMap.values());
+      const healthTotalAlerts = downDevices.length + blockedEndSystems.length + alertAppliances.length;
+
       viewport.innerHTML = `
         ${renderErrorBanner([...(almRes.errors || []), ...(evtRes.errors || [])], almRes.query || evtRes.query)}
-        <div class="tabs">
-          <button class="tab-btn ${almState.tab === "alarms" ? "active" : ""}" data-atab="alarms">Alarmes (${almRes.available ? alarms.length : downDevices.length})</button>
-          <button class="tab-btn ${almState.tab === "events" ? "active" : ""}" data-atab="events">Événements (${events.length})</button>
-        </div>
 
-        ${almState.tab === "alarms" ? `
+        ${almRes.available || evtRes.available ? `
+          <div class="tabs">
+            <button class="tab-btn ${almState.tab === "alarms" ? "active" : ""}" data-atab="alarms">Alarmes (${almRes.available ? rawAlarms.length : downDevices.length})</button>
+            <button class="tab-btn ${almState.tab === "events" ? "active" : ""}" data-atab="events">Événements (${events.length})</button>
+          </div>
+        ` : `
+          <div class="alert-banner" style="margin-bottom:14px;">
+            <div>
+              <strong>Info API GraphQL XIQ-SE :</strong> Le schéma NBI de votre serveur (${(indexed?.queryGroups || []).map((g) => `<code>${esc(g.domain)}</code>`).join(", ")}) n'expose pas la table <em>OneView Alarms / Events</em> (limitation native de l'API NBI sur cette version).
+              Cette vue regroupe automatiquement <strong>toutes les alertes temps réel disponibles via l'API</strong> : équipements Down, terminaux NAC bloqués/quarantaine, santé des moteurs NAC et hygiène NAC.
+            </div>
+            <span class="badge badge-cyan" title="${esc(devStatusRes.paginationMode || "")}">${allDevicesCount.toLocaleString("fr-FR")} équip. analysés</span>
+          </div>
+
+          <div class="kpi-grid" style="margin-bottom:14px;">
+            <div class="kpi-card" style="cursor:pointer;border-color:${downDevices.length ? "rgba(239,68,68,0.45)" : "rgba(34,197,94,0.35)"};" data-hsub="down">
+              <div class="kpi-label">Équipements Down</div>
+              <div class="kpi-value" style="color:${downDevices.length ? "var(--red)" : "var(--green)"};">${downDevices.length}</div>
+              <div class="kpi-sub">sur ${allDevicesCount.toLocaleString("fr-FR")} équipements (${esc(devStatusRes.paginationMode || "NBI")})</div>
+            </div>
+            <div class="kpi-card" style="cursor:pointer;border-color:${blockedEndSystems.length ? "rgba(245,158,11,0.45)" : "rgba(34,197,94,0.35)"};" data-hsub="nac_blocked">
+              <div class="kpi-label">NAC Quarantaine / Rejetés</div>
+              <div class="kpi-value" style="color:${blockedEndSystems.length ? "var(--amber)" : "var(--green)"};">${blockedEndSystems.length}</div>
+              <div class="kpi-sub">sur ${sampledEndSystems.length.toLocaleString("fr-FR")} End-Systems inspectés</div>
+            </div>
+            <div class="kpi-card" style="cursor:pointer;border-color:${alertAppliances.length ? "rgba(239,68,68,0.45)" : "rgba(34,197,94,0.35)"};" data-hsub="health">
+              <div class="kpi-label">Moteurs NAC (Appliances)</div>
+              <div class="kpi-value" style="color:${alertAppliances.length ? "var(--red)" : "var(--green)"};">${appliances.length - alertAppliances.length}/${appliances.length}</div>
+              <div class="kpi-sub">${alertAppliances.length ? `${alertAppliances.length} moteur(s) en alerte` : "Tous les moteurs opérationnels"}</div>
+            </div>
+            <div class="kpi-card" style="cursor:pointer;" onclick="XIQApp.navigate('suggestions')">
+              <div class="kpi-label">Hygiène NAC (Audit)</div>
+              <div class="kpi-value" style="color:${auditSummary && (auditSummary.neverSeenCount || auditSummary.duplicateCount) ? "var(--amber)" : "var(--cyan)"};">${auditSummary ? ((auditSummary.neverSeenCount || 0) + (auditSummary.duplicateCount || 0)) : "—"}</div>
+              <div class="kpi-sub">${auditSummary ? `${auditSummary.neverSeenCount || 0} jamais vues · ${auditSummary.duplicateCount || 0} doublons` : "Lancer un audit MAC →"}</div>
+            </div>
+          </div>
+
+          <div class="tabs">
+            <button class="tab-btn ${almState.subTab === "down" ? "active" : ""}" data-hsub="down">Équipements Down (${downDevices.length})</button>
+            <button class="tab-btn ${almState.subTab === "nac_blocked" ? "active" : ""}" data-hsub="nac_blocked">NAC Quarantaine / Rejetés (${blockedEndSystems.length})</button>
+            <button class="tab-btn ${almState.subTab === "health" ? "active" : ""}" data-hsub="health">Moteurs NAC &amp; Hygiène (${appliances.length})</button>
+          </div>
+        `}
+
+        ${(almRes.available || evtRes.available) ? (almState.tab === "alarms" ? `
           <div class="toolbar">
             <div class="toolbar-group">
               ${["ALL", "Critical", "Error", "Warning", "Info"].map((s) => `
                 <button class="btn btn-xs ${almState.sev === s ? "btn-primary" : "btn-ghost"}" data-sev="${s}">${s === "ALL" ? "Toutes" : s}</button>`).join("")}
+              <input id="alm-search" placeholder="Filtrer IP, switch, message..." value="${esc(almState.search)}" style="width:210px;" />
               <select id="alm-days" class="select-compact" title="Fenêtre temporelle">
                 <option value="1" ${almState.days === 1 ? "selected" : ""}>Dernières 24h</option>
                 <option value="7" ${almState.days === 7 ? "selected" : ""}>7 derniers jours</option>
                 <option value="30" ${almState.days === 30 ? "selected" : ""}>30 derniers jours</option>
               </select>
+              ${(almRes.workingSources || []).length > 1 ? `
+                <select id="alm-source-sel" class="select-compact" title="Source GraphQL des alarmes">
+                  ${almRes.workingSources.map((s) => `<option value="${esc(s.key)}" ${s.key === almRes.sourceLabel ? "selected" : ""}>Source : ${esc(s.key)} (${s.count})</option>`).join("")}
+                </select>` : ""}
             </div>
             <div class="toolbar-group">
-              ${almRes.sourceLabel ? `<span class="badge badge-cyan">Source : ${esc(almRes.sourceLabel)}</span>` : ""}
+              ${almRes.sourceLabel && (almRes.workingSources || []).length <= 1 ? `<span class="badge badge-cyan">Source : ${esc(almRes.sourceLabel)}</span>` : ""}
+              ${filteredAlarms.length || downDevices.length ? `<button class="btn btn-sm btn-secondary" id="btn-export-alm-csv">Exporter CSV</button>` : ""}
               ${almRes.query ? `<button class="btn btn-sm btn-ghost" data-open-studio="1">&lt;/&gt; GraphQL</button>` : ""}
             </div>
           </div>
 
-          ${almRes.available ? `
-            <div class="panel">
-              ${filtered.length && hasAck ? `<div class="table-wrap"><table>
-                <thead><tr><th>ID</th><th>Sévérité</th><th>Source</th><th>Message</th><th>Date</th><th>Actions</th></tr></thead>
-                <tbody>
-                  ${filtered.map((a) => {
-                    const sb = /crit|err/i.test(String(a.severity)) ? "badge-red" : /warn/i.test(String(a.severity)) ? "badge-amber" : "badge-cyan";
-                    return `<tr>
-                      <td class="mono">${esc(a.id)}</td>
-                      <td><span class="badge ${sb}">${esc(a.severity)}</span></td>
-                      <td><strong>${esc(a.sourceName || "—")}</strong> ${a.sourceIp ? XIQApi.switchIpLink(a.sourceIp) : ""}</td>
-                      <td>${esc(a.message || a.description || "")}</td>
-                      <td class="mono">${esc((a.timestamp || "").slice(0, 19).replace("T", " "))}</td>
-                      <td style="white-space:nowrap;">
-                        ${!a.acknowledged ? `<button class="btn btn-xs btn-secondary" data-ack="${esc(a.id)}">Acquitter</button>` : `<span class="badge badge-muted">Acq.</span>`}
-                        ${hasClr ? `<button class="btn btn-xs btn-danger" data-clr="${esc(a.id)}">Clôturer</button>` : ""}
-                      </td>
-                    </tr>`;
-                  }).join("")}
-                </tbody>
-              </table></div>` : renderDynamicTable(filtered, "Aucune alarme active sur cette période.")}
+          <div class="panel">
+            ${filteredAlarms.length ? `<div class="table-wrap"><table>
+              <thead><tr><th>ID</th><th>Sévérité</th><th>Source</th><th>Message</th><th>Date</th>${hasAck || hasClr ? "<th>Actions</th>" : ""}</tr></thead>
+              <tbody>
+                ${filteredAlarms.slice(0, 500).map((a) => {
+                  const sb = /crit|fatal|emerg|err|major|severe/i.test(a.severity) ? "badge-red" : /warn|minor/i.test(a.severity) ? "badge-amber" : "badge-cyan";
+                  return `<tr>
+                    <td class="mono">${esc(a.id || "—")}</td>
+                    <td><span class="badge ${sb}">${esc(a.severity)}</span></td>
+                    <td><strong>${esc(a.sourceName)}</strong> ${a.sourceIp ? `<div>${XIQApi.switchIpLink(a.sourceIp)}</div>` : ""}</td>
+                    <td>${esc(a.message || "—")}</td>
+                    <td class="mono">${esc(a.timestamp || "—")}</td>
+                    ${hasAck || hasClr ? `<td style="white-space:nowrap;">
+                      ${hasAck ? (!a.acknowledged && a.id ? `<button class="btn btn-xs btn-secondary" data-ack="${esc(a.id)}">Acquitter</button>` : `<span class="badge badge-muted">${a.acknowledged ? "Acq." : "—"}</span>`) : ""}
+                      ${hasClr && a.id ? `<button class="btn btn-xs btn-danger" data-clr="${esc(a.id)}">Clôturer</button>` : ""}
+                    </td>` : ""}
+                  </tr>`;
+                }).join("")}
+              </tbody>
+            </table></div>` : `<div class="empty-state">Aucune alarme active sur cette période (source interrogée : <code>${esc(almRes.sourceLabel)}</code>).</div>`}
+          </div>
+          ${downDevices.length ? `
+            <div class="panel" style="margin-top:12px;">
+              <div class="panel-header">
+                <div class="panel-title">Équipements actuellement Down (${downDevices.length} / ${allDevicesCount})</div>
+                <span class="badge badge-red">${downDevices.length} injoignable(s)</span>
+              </div>
+              ${renderDynamicTable(downDevices, "Aucun équipement Down.")}
+            </div>` : ""}
+        ` : `
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <input id="alm-search" placeholder="Filtrer les événements..." value="${esc(almState.search)}" style="width:240px;" />
+              <select id="alm-days" class="select-compact" title="Fenêtre temporelle">
+                <option value="1" ${almState.days === 1 ? "selected" : ""}>Dernières 24h</option>
+                <option value="7" ${almState.days === 7 ? "selected" : ""}>7 derniers jours</option>
+                <option value="30" ${almState.days === 30 ? "selected" : ""}>30 derniers jours</option>
+              </select>
+              ${(evtRes.workingSources || []).length > 1 ? `
+                <select id="evt-source-sel" class="select-compact" title="Source GraphQL des événements">
+                  ${evtRes.workingSources.map((s) => `<option value="${esc(s.key)}" ${s.key === evtRes.sourceLabel ? "selected" : ""}>Source : ${esc(s.key)} (${s.count})</option>`).join("")}
+                </select>` : ""}
             </div>
-          ` : `
-            <div class="alert-banner">
-              <div>
-                <strong>Diagnostic API XIQ-SE :</strong> Aucune requête d'alarmes active n'est exposée dans le schéma GraphQL NBI de votre serveur (domaines détectés : ${(indexed?.queryGroups || []).map((g) => `<code>${esc(g.domain)}</code>`).join(", ")}).
-                Dans XIQ-SE, l'API GraphQL NBI n'expose pas toujours la table des alarmes actives (ou le groupe d'autorisation du client API ne dispose pas de la capacité correspondante).
+            <div class="toolbar-group">
+              ${evtRes.sourceLabel && (evtRes.workingSources || []).length <= 1 ? `<span class="badge badge-cyan">Source : ${esc(evtRes.sourceLabel)}</span>` : ""}
+              ${filteredEvents.length ? `<button class="btn btn-sm btn-secondary" id="btn-export-evt-csv">Exporter CSV</button>` : ""}
+              ${evtRes.query ? `<button class="btn btn-sm btn-ghost" data-open-studio="1">&lt;/&gt; GraphQL</button>` : ""}
+            </div>
+          </div>
+          <div class="panel">
+            ${renderDynamicTable(filteredEvents, evtRes.available ? `Aucun événement retourné sur cette période (source : ${evtRes.sourceLabel}).` : "Aucune requête d'événements appelable automatiquement n'a répondu sur ce schéma GraphQL NBI.")}
+          </div>
+        `) : (almState.subTab === "down" ? `
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <input id="alm-search" placeholder="Filtrer IP, switch, site, modèle..." value="${esc(almState.search)}" style="width:260px;" />
+              <span style="font-size:12px;color:var(--text-muted);">${filteredDown.length} / ${downDevices.length} injoignable(s)</span>
+            </div>
+            <div class="toolbar-group">
+              ${filteredDown.length ? `<button class="btn btn-sm btn-secondary" id="btn-export-alm-csv">Exporter CSV</button>` : ""}
+              ${devStatusRes.query ? `<button class="btn btn-sm btn-ghost" data-open-studio="1">&lt;/&gt; GraphQL</button>` : ""}
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div class="panel-title">Équipements actuellement Down (${filteredDown.length} sur ${allDevicesCount.toLocaleString("fr-FR")})</div>
+              <span class="badge ${filteredDown.length ? "badge-red" : "badge-green"}">${filteredDown.length ? `${filteredDown.length} injoignable(s)` : "Tous les équipements sont Up"}</span>
+            </div>
+            ${filteredDown.length ? `<div class="table-wrap"><table>
+              <thead><tr><th>Statut</th><th>Nom / IP</th><th>Modèle</th><th>Site</th><th>Uptime</th></tr></thead>
+              <tbody>
+                ${filteredDown.map((d) => `
+                  <tr>
+                    <td><span class="badge badge-red">● Down</span></td>
+                    <td><strong>${esc(d.sysName || d.deviceName || d.ip || "—")}</strong><div>${XIQApi.switchIpLink(d.ip || "")}</div></td>
+                    <td>${esc(d.deviceDisplayFamily || d.family || "—")}</td>
+                    <td><span class="badge badge-muted">${esc(d.sitePath || "—")}</span></td>
+                    <td class="mono">${esc(d.sysUpTime || "—")}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table></div>` : `<div class="empty-state">Aucun équipement Down détecté actuellement sur votre parc XIQ-SE.</div>`}
+          </div>
+        ` : almState.subTab === "nac_blocked" ? `
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <input id="alm-search" placeholder="Filtrer MAC, IP, utilisateur, switch, profil..." value="${esc(almState.search)}" style="width:280px;" />
+              <span style="font-size:12px;color:var(--text-muted);">${filteredBlocked.length} terminal(aux) bloqué(s)/quarantaine</span>
+            </div>
+            <div class="toolbar-group">
+              ${filteredBlocked.length ? `<button class="btn btn-sm btn-secondary" id="btn-export-blocked-csv">Exporter CSV</button>` : ""}
+              <button class="btn btn-sm btn-ghost" onclick="XIQApp.navigate('nac')">Ouvrir NAC →</button>
+            </div>
+          </div>
+          <div class="panel">
+            ${filteredBlocked.length ? `<div class="table-wrap"><table>
+              <thead><tr><th>État</th><th>MAC / IP</th><th>Utilisateur / Hôte</th><th>Switch &amp; Port</th><th>Profil / Auth</th><th>Action</th></tr></thead>
+              <tbody>
+                ${filteredBlocked.slice(0, 300).map((e) => {
+                  const st = e.state || e.authorizationState || e.status || "Bloqué";
+                  const swIp = e.switchIp || e.switchIP || "";
+                  const port = e.portName || e.switchPortName || e.switchPort || e.port || "";
+                  return `<tr>
+                    <td><span class="badge badge-red">${esc(st)}</span></td>
+                    <td class="mono"><strong>${XIQApi.macLink(e.macAddress || "")}</strong><div style="color:var(--text-muted);">${esc(e.ipAddress || "")}</div></td>
+                    <td><strong>${esc(e.username || e.userName || "—")}</strong><div style="font-size:11.5px;color:var(--text-muted);">${esc(e.hostName || "")}</div></td>
+                    <td class="mono">${swIp ? XIQApi.switchIpLink(swIp) : "—"}${port ? `<div style="color:var(--cyan);">${esc(port)}</div>` : ""}</td>
+                    <td>${esc(e.profile || e.policy || "—")}<div style="font-size:11.5px;color:var(--text-muted);">${esc(e.authType || "")}</div></td>
+                    <td><button class="btn btn-xs btn-secondary" onclick="XIQApp.navigate('locator', '${esc(e.macAddress || e.ipAddress || "")}')">Localiser</button></td>
+                  </tr>`;
+                }).join("")}
+              </tbody>
+            </table></div>` : `<div class="empty-state">Aucun terminal en Quarantaine ou Rejeté sur les ${sampledEndSystems.length.toLocaleString("fr-FR")} End-Systems inspectés.</div>`}
+          </div>
+        ` : `
+          <div class="grid-2">
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-title">Moteurs NAC (ExtremeControl Appliances)</div>
+                <span class="badge ${alertAppliances.length ? "badge-red" : "badge-green"}">${alertAppliances.length ? `${alertAppliances.length} alerte(s)` : `${appliances.length} actif(s)`}</span>
+              </div>
+              <div class="panel-body">
+                ${appliances.length ? appliances.map((a) => {
+                  const bad = /down|err|fail|off|warn|degrad/i.test(String(a.status || a.state || ""));
+                  return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:8px;background:var(--bg-elevated);border:1px solid ${bad ? "rgba(239,68,68,0.45)" : "var(--border)"};border-radius:8px;">
+                    <div>
+                      <strong>${esc(a.displayName || a.name || a.hostName || a.ipAddress || "Moteur NAC")}</strong>
+                      <div style="margin-top:2px;">${XIQApi.switchIpLink(a.ipAddress || a.ip || "")} ${a.version ? `<span class="badge badge-muted">${esc(a.version)}</span>` : ""}</div>
+                    </div>
+                    <div style="text-align:right;">
+                      <span class="badge ${bad ? "badge-red" : "badge-green"}">${esc(a.status || a.state || "Actif")}</span>
+                      ${(a.activeEndSystems ?? a.endSystemCount) !== undefined ? `<div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">${a.activeEndSystems ?? a.endSystemCount} sessions</div>` : ""}
+                    </div>
+                  </div>`;
+                }).join("") : `<div class="empty-state">Aucun moteur NAC retourné.</div>`}
               </div>
             </div>
             <div class="panel">
               <div class="panel-header">
-                <div class="panel-title">Alertes de disponibilité détectées (Équipements Down : ${downDevices.length})</div>
-                <span class="badge ${downDevices.length ? "badge-red" : "badge-green"}">${downDevices.length ? `${downDevices.length} injoignable(s)` : "Tous les équipements sont Up"}</span>
+                <div class="panel-title">Alertes d'Hygiène NAC (Groupes &amp; MAC)</div>
+                <button class="btn btn-xs btn-primary" onclick="XIQApp.navigate('suggestions')">Ouvrir Suggestions →</button>
               </div>
-              ${renderDynamicTable(downDevices, "Aucun équipement Down détecté actuellement sur votre parc XIQ-SE.")}
+              <div class="panel-body">
+                ${auditSummary ? `
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+                    <div style="padding:10px;background:var(--bg-elevated);border-radius:8px;border:1px solid var(--border);">
+                      <div style="font-size:11.5px;color:var(--text-muted);">MAC jamais vues</div>
+                      <div style="font-size:20px;font-weight:800;color:${auditSummary.neverSeenCount ? "var(--red)" : "var(--green)"};">${auditSummary.neverSeenCount ?? 0}</div>
+                    </div>
+                    <div style="padding:10px;background:var(--bg-elevated);border-radius:8px;border:1px solid var(--border);">
+                      <div style="font-size:11.5px;color:var(--text-muted);">Doublons multi-groupes</div>
+                      <div style="font-size:20px;font-weight:800;color:${auditSummary.duplicateCount ? "var(--amber)" : "var(--green)"};">${auditSummary.duplicateCount ?? 0}</div>
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <button class="btn btn-sm btn-secondary" onclick="XIQApp.navigate('mac_audit')">Ouvrir Audit MAC &amp; Doublons</button>
+                    <button class="btn btn-sm btn-secondary" onclick="XIQApp.navigate('suggestions')">Suggestions de Nettoyage</button>
+                  </div>
+                ` : `
+                  <div class="empty-state" style="padding:18px;">
+                    <p style="margin-bottom:10px;">Lancez un audit MAC pour détecter les entrées obsolètes, doublons et conflits Blacklist.</p>
+                    <button class="btn btn-sm btn-primary" onclick="XIQApp.navigate('mac_audit')">Lancer l'Audit MAC</button>
+                  </div>
+                `}
+              </div>
             </div>
-          `}
-        ` : `
-          <div class="panel">
-            ${evtRes.sourceLabel ? `<div class="panel-header"><div class="panel-title">Source : ${esc(evtRes.sourceLabel)}</div></div>` : ""}
-            ${renderDynamicTable(events, evtRes.available ? "Aucun événement sur cette période." : "Aucune requête d'événements sans paramètre obligatoire n'est exposée dans le schéma GraphQL NBI de ce serveur.")}
           </div>
-        `}
+        `)}
 
-        <div class="panel" style="margin-top:16px;">
-          <div class="panel-header">
-            <div class="panel-title">Diagnostic complet du schéma (Alarmes &amp; Événements)</div>
-            <span class="badge badge-cyan">${uniqueDiscovered.length} requête(s) · ${allRelatedMuts.length} mutation(s) détectée(s)</span>
-          </div>
+        <details class="panel" style="margin-top:16px;">
+          <summary class="panel-header" style="cursor:pointer;list-style:none;">
+            <div class="panel-title">▸ Diagnostic technique du schéma GraphQL NBI (Alarmes &amp; Événements)</div>
+            <span class="badge badge-muted">${uniqueDiscovered.length} requête(s) · ${allRelatedMuts.length} mutation(s)</span>
+          </summary>
           <div class="panel-body">
+            ${activeProbes.length ? `
+              <div style="margin-bottom:12px;">
+                <div style="font-size:12px;font-weight:700;color:var(--text-secondary);margin-bottom:6px;">Sondes GraphQL testées :</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>Requête testée</th><th>Statut</th><th>Résultats</th><th>Action</th></tr></thead>
+                  <tbody>
+                    ${activeProbes.map((p) => `
+                      <tr>
+                        <td class="mono">${esc(p.key)}</td>
+                        <td>${p.ok ? `<span class="badge badge-green">OK</span>` : `<span class="badge badge-red">Erreur</span>`}</td>
+                        <td>${p.ok ? `<strong>${p.count}</strong> élément(s)` : `<span style="color:var(--red);font-size:11.5px;">${esc(p.errorMsg || "Réponse non exploitable")}</span>`}</td>
+                        <td>${p.query ? `<button class="btn btn-xs btn-ghost" data-open-probe="${esc(p.key)}">&lt;/&gt; Studio</button>` : "—"}</td>
+                      </tr>`).join("")}
+                  </tbody>
+                </table></div>
+              </div>` : ""}
             ${uniqueDiscovered.length || allRelatedMuts.length ? `
+              <div style="font-size:12px;font-weight:700;color:var(--text-secondary);margin-bottom:6px;">Opérations Alarmes / Événements exposées par le schéma :</div>
               <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                ${uniqueDiscovered.map((q) => `<button class="btn btn-xs btn-secondary" data-gen-op="query" data-gen-dom="${esc(q.domainName)}" data-gen-fn="${esc(q.field.name)}" title="${esc(q.field.description || "")}">Q: ${esc(q.domainName)}.${esc(q.field.name)}</button>`).join("")}
+                ${uniqueDiscovered.map((q) => `<button class="btn btn-xs ${q.callable ? "btn-secondary" : "btn-ghost"}" data-gen-op="query" data-gen-dom="${esc(q.domainName)}" data-gen-fn="${esc(q.field.name)}" title="${esc((q.callable ? "" : "[Paramètre obligatoire] ") + (q.field.description || ""))}">Q: ${esc(q.domainName)}.${esc(q.field.name)}${q.callable ? "" : " (param.)"}</button>`).join("")}
                 ${allRelatedMuts.map((m) => `<button class="btn btn-xs btn-ghost" style="border-color:rgba(245,158,11,0.45);color:var(--amber);" data-gen-op="mutation" data-gen-dom="${esc(m.domainName)}" data-gen-fn="${esc(m.field.name)}" title="${esc(m.field.description || "")}">M: ${esc(m.domainName)}.${esc(m.field.name)}</button>`).join("")}
               </div>
-            ` : `<div style="font-size:12.5px;color:var(--text-secondary);">Votre serveur XIQ-SE n'expose aucun champ contenant <code>alarm</code>, <code>event</code>, <code>trap</code> ou <code>log</code> dans son schéma GraphQL NBI actuel. Vérifiez les droits de votre client API dans <em>XIQ-SE &gt; Administration &gt; Users &gt; Authorization Groups</em> ou consultez le schéma complet dans <strong>Studio GraphQL</strong>.</div>`}
+            ` : `<div style="font-size:12.5px;color:var(--text-secondary);">Aucune requête de lecture d'alarmes ou d'événements n'est exposée dans le schéma GraphQL NBI de ce serveur XIQ-SE. Pour exporter les alarmes OneView en temps réel, utilisez le transfert <strong>Syslog</strong> ou les <strong>Actions d'Alarme / Workflows</strong> côté XIQ-SE.</div>`}
           </div>
-        </div>
+        </details>
       `;
 
-      bindOpenStudio(viewport, almRes.query || evtRes.query);
+      bindOpenStudio(viewport, almRes.available ? (almState.tab === "events" ? (evtRes.query || almRes.query) : almRes.query) : (devStatusRes.query || ""));
       bindDomainCatalogButtons(viewport, indexed);
+
+      viewport.querySelectorAll("[data-open-probe]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const p = probeMap.get(btn.dataset.openProbe);
+          if (p && p.query) openInStudio(p.query, {});
+        });
+      });
+
       viewport.querySelectorAll("[data-atab]").forEach((b) => { b.addEventListener("click", () => { almState.tab = b.dataset.atab; drawAlm(); }); });
+      viewport.querySelectorAll("[data-hsub]").forEach((b) => { b.addEventListener("click", () => { almState.subTab = b.dataset.hsub; drawAlm(); }); });
       viewport.querySelectorAll("[data-sev]").forEach((b) => { b.addEventListener("click", () => { almState.sev = b.dataset.sev; drawAlm(); }); });
+
+      const almSearch = viewport.querySelector("#alm-search");
+      if (almSearch) {
+        almSearch.addEventListener("input", (e) => {
+          almState.search = e.target.value;
+          const pos = e.target.selectionStart;
+          drawAlm();
+          const el = viewport.querySelector("#alm-search");
+          if (el) { el.focus(); el.setSelectionRange(pos, pos); }
+        });
+      }
+
       const daysSel = viewport.querySelector("#alm-days");
       if (daysSel) {
         daysSel.addEventListener("change", (e) => {
@@ -3784,19 +4473,61 @@ window.OpsViews = (() => {
           renderAlarms(viewport);
         });
       }
+      const almSrcSel = viewport.querySelector("#alm-source-sel");
+      if (almSrcSel) {
+        almSrcSel.addEventListener("change", (e) => {
+          almState.alarmSourceKey = e.target.value;
+          renderAlarms(viewport);
+        });
+      }
+      const evtSrcSel = viewport.querySelector("#evt-source-sel");
+      if (evtSrcSel) {
+        evtSrcSel.addEventListener("change", (e) => {
+          almState.eventSourceKey = e.target.value;
+          renderAlarms(viewport);
+        });
+      }
+
+      const expAlm = viewport.querySelector("#btn-export-alm-csv");
+      if (expAlm) {
+        expAlm.addEventListener("click", () => {
+          const rows = almRes.available
+            ? filteredAlarms.map((a) => ({ ID: a.id, Severite: a.severity, Source: a.sourceName, IP: a.sourceIp, Message: a.message, Date: a.timestamp, Acquittee: a.acknowledged ? "Oui" : "Non" }))
+            : SchemaTools.extractTableRows({ downDevices: filteredDown });
+          XIQApi.exportFile(`xiqse-alarms-${Date.now()}.csv`, XIQApi.rowsToCsv(rows));
+        });
+      }
+      const expBlocked = viewport.querySelector("#btn-export-blocked-csv");
+      if (expBlocked) {
+        expBlocked.addEventListener("click", () => {
+          XIQApi.exportFile(`xiqse-nac-blocked-${Date.now()}.csv`, XIQApi.rowsToCsv(filteredBlocked));
+        });
+      }
+      const expEvt = viewport.querySelector("#btn-export-evt-csv");
+      if (expEvt) {
+        expEvt.addEventListener("click", () => {
+          const rows = SchemaTools.extractTableRows({ events: filteredEvents });
+          XIQApi.exportFile(`xiqse-events-${Date.now()}.csv`, XIQApi.rowsToCsv(rows));
+        });
+      }
+
       viewport.querySelectorAll("[data-ack]").forEach((b) => {
         b.addEventListener("click", async () => {
-          const m = `mutation Ack($id: String!) { alarms { acknowledgeAlarm(input: { id: $id }) { status message } } }`;
-          const r = await runOp(m, { id: b.dataset.ack }, "alarms");
-          XIQApi.toast(r.data?.alarms?.acknowledgeAlarm?.message || "Acquittée", r.ok ? "success" : "error");
+          const built = buildAdaptiveAlarmMutation(indexed, ackMutOp, b.dataset.ack);
+          if (!built) return XIQApi.toast("Mutation d'acquittement introuvable dans ce schéma.", "warn");
+          const r = await runOp(built.query, built.variables, "alarms");
+          const out = built.domainName ? r.data?.[built.domainName]?.[built.fieldName] : r.data?.[built.fieldName];
+          XIQApi.toast(out?.message || r.errors?.[0]?.message || "Acquittée", r.ok ? "success" : "error");
           renderAlarms(viewport);
         });
       });
       viewport.querySelectorAll("[data-clr]").forEach((b) => {
         b.addEventListener("click", async () => {
-          const m = `mutation Clr($id: String!) { alarms { clearAlarm(input: { id: $id }) { status message } } }`;
-          const r = await runOp(m, { id: b.dataset.clr }, "alarms");
-          XIQApi.toast(r.data?.alarms?.clearAlarm?.message || "Clôturée", r.ok ? "success" : "error");
+          const built = buildAdaptiveAlarmMutation(indexed, clrMutOp, b.dataset.clr);
+          if (!built) return XIQApi.toast("Mutation de clôture introuvable dans ce schéma.", "warn");
+          const r = await runOp(built.query, built.variables, "alarms");
+          const out = built.domainName ? r.data?.[built.domainName]?.[built.fieldName] : r.data?.[built.fieldName];
+          XIQApi.toast(out?.message || r.errors?.[0]?.message || "Clôturée", r.ok ? "success" : "error");
           renderAlarms(viewport);
         });
       });
